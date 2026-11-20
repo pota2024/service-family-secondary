@@ -1,0 +1,452 @@
+rules_version = '2';
+
+// قواعد أمان Firestore – خدمة أسرة ثانوي (المرحلة 1: كاملة لكل المجموعات)
+// أي تعديل هنا يجب أن يُرفق باختبار في tests/rules/firestore.rules.test.js
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ───────────── دوال مساعدة ─────────────
+    function signedIn() { return request.auth != null; }
+
+    function userPath(uid)  { return /databases/$(database)/documents/users/$(uid); }
+    function reqPath(uid)   { return /databases/$(database)/documents/registrationRequests/$(uid); }
+    function settingsPath() { return /databases/$(database)/documents/settings/app; }
+
+    function hasUser(uid)       { return exists(userPath(uid)); }
+    function userData(uid)      { return get(userPath(uid)).data; }
+    function afterUserData(uid) { return getAfter(userPath(uid)).data; }
+    function me()               { return userData(request.auth.uid); }
+
+    function activeUser() {
+      return signedIn() && hasUser(request.auth.uid) && me().status == 'active';
+    }
+    // مستخدم قيد المراجعة أو مفعّل (يُسمح له فقط بإكمال بياناته الشخصية)
+    function liveUser() {
+      return signedIn() && hasUser(request.auth.uid)
+        && me().status in ['pending', 'active'];
+    }
+    function isGeneral() { return activeUser() && me().role == 'general'; }
+    function isServant() { return activeUser() && me().role == 'servant'; }
+    function mySection() { return me().section; }
+    function isSection(s) { return s in ['boys', 'girls']; }
+
+    function canManage(section) {
+      return isGeneral()
+        || (isServant() && isSection(section) && me().section == section);
+    }
+
+    function targetIsMember(uid, section) {
+      return hasUser(uid)
+        && userData(uid).role == 'member'
+        && userData(uid).status == 'active'
+        && userData(uid).section == section;
+    }
+
+    function strLen(v, min, max) {
+      return v is string && v.size() >= min && v.size() <= max;
+    }
+
+    function registrationOpen() {
+      return !exists(settingsPath())
+        || get(settingsPath()).data.get('registrationEnabled', true) != false;
+    }
+
+    // الشات: الغرف الخمس ثابتة المعرفات
+    function validChat(chatId) {
+      return chatId in ['boys_members', 'girls_members', 'boys_servants', 'girls_servants', 'servants_all'];
+    }
+    function canAccessChat(chatId) {
+      return validChat(chatId) && activeUser() && (
+        me().role == 'general'
+        || (chatId == 'boys_members'  && me().section == 'boys')
+        || (chatId == 'girls_members' && me().section == 'girls')
+        || (chatId == 'boys_servants'  && me().role == 'servant' && me().section == 'boys')
+        || (chatId == 'girls_servants' && me().role == 'servant' && me().section == 'girls')
+        || (chatId == 'servants_all'   && me().role == 'servant')
+      );
+    }
+    function canModerateChat(chatId) {
+      return isGeneral() || (isServant() && (
+        (chatId == 'boys_members'  && me().section == 'boys')
+        || (chatId == 'girls_members' && me().section == 'girls')));
+    }
+
+    // ───────────── users ─────────────
+    match /users/{uid} {
+      allow read: if signedIn() && (
+        request.auth.uid == uid
+        || isGeneral()
+        || (isServant() && resource.data.section in ['boys', 'girls']
+            && resource.data.section == mySection())
+      );
+
+      // إنشاء حساب جديد: دائمًا member + pending، ولا يمكن اختيار الدور أو الاعتماد
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && registrationOpen()
+        && request.resource.data.keys().hasOnly(['role', 'section', 'status', 'createdAt', 'updatedAt'])
+        && request.resource.data.keys().hasAll(['role', 'section', 'status', 'createdAt'])
+        && request.resource.data.role == 'member'
+        && request.resource.data.status == 'pending'
+        && request.resource.data.section in ['boys', 'girls', 'all']
+        && request.resource.data.createdAt == request.time
+        && existsAfter(reqPath(uid))
+        && getAfter(reqPath(uid)).data.requestedSection == request.resource.data.section;
+
+      allow update: if
+        // العام: أي تعديل صحيح الشكل
+        (isGeneral()
+          && request.resource.data.keys().hasOnly(['role', 'section', 'status', 'createdAt', 'updatedAt'])
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.role in ['member', 'servant', 'general']
+          && request.resource.data.status in ['pending', 'active', 'rejected', 'suspended']
+          && request.resource.data.section in ['boys', 'girls', 'all'])
+        // الخادم: يراجع المخدومين في قسمه فقط، ولا يغير إلا الحالة
+        || (isServant()
+          && resource.data.role == 'member'
+          && resource.data.section == mySection()
+          && exists(reqPath(uid))
+          && get(reqPath(uid)).data.requestedRole == 'member'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+          && request.resource.data.status in ['active', 'rejected', 'suspended']
+          && request.resource.data.updatedAt == request.time);
+
+      allow delete: if isGeneral();
+    }
+
+    // ───────────── registrationRequests ─────────────
+    match /registrationRequests/{uid} {
+      allow read: if signedIn() && (
+        request.auth.uid == uid
+        || isGeneral()
+        || (isServant() && resource.data.requestedRole == 'member'
+            && resource.data.requestedSection == mySection())
+      );
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(
+             ['uid', 'displayName', 'requestedRole', 'requestedSection', 'status', 'createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && strLen(request.resource.data.displayName, 2, 60)
+        && request.resource.data.requestedRole in ['member', 'servant', 'general']
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time
+        && (
+          (request.resource.data.requestedRole == 'general' && request.resource.data.requestedSection == 'all')
+          || (request.resource.data.requestedRole != 'general' && isSection(request.resource.data.requestedSection))
+        )
+        && existsAfter(userPath(uid));
+
+      allow update: if
+        (isGeneral()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'reviewedBy', 'reviewedAt'])
+          && request.resource.data.status in ['approved', 'rejected']
+          && request.resource.data.reviewedBy == request.auth.uid)
+        || (isServant()
+          && resource.data.requestedRole == 'member'
+          && resource.data.requestedSection == mySection()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'reviewedBy', 'reviewedAt'])
+          && request.resource.data.status in ['approved', 'rejected']
+          && request.resource.data.reviewedBy == request.auth.uid);
+
+      allow delete: if isGeneral();
+    }
+
+    // ───────────── profiles (بيانات عرض فقط) ─────────────
+    match /profiles/{uid} {
+      allow read: if signedIn() && (
+        request.auth.uid == uid
+        || isGeneral()
+        || (activeUser() && resource.data.section == mySection())
+      );
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['displayName', 'photoUrl', 'section', 'createdAt'])
+        && request.resource.data.keys().hasAll(['displayName', 'section', 'createdAt'])
+        && strLen(request.resource.data.displayName, 2, 60)
+        && (!('photoUrl' in request.resource.data) || strLen(request.resource.data.photoUrl, 0, 280000))
+        && request.resource.data.createdAt == request.time
+        && existsAfter(userPath(uid))
+        && afterUserData(uid).status in ['pending', 'active']
+        && request.resource.data.section == afterUserData(uid).section;
+
+      allow update: if liveUser()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName', 'photoUrl'])
+        && strLen(request.resource.data.displayName, 2, 60)
+        && (!('photoUrl' in request.resource.data) || strLen(request.resource.data.photoUrl, 0, 280000));
+
+      allow delete: if isGeneral();
+    }
+
+    // ───────────── privateUsers ─────────────
+    match /privateUsers/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isGeneral());
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['phone', 'birthDate'])
+        && request.resource.data.keys().hasAll(['phone'])
+        && strLen(request.resource.data.phone, 8, 16)
+        && (!('birthDate' in request.resource.data) || request.resource.data.birthDate is timestamp)
+        && existsAfter(userPath(uid))
+        && afterUserData(uid).status in ['pending', 'active'];
+
+      // الهاتف مرتبط بحساب الدخول فلا يتغير من التطبيق؛ يُسمح بتعديل تاريخ الميلاد فقط
+      allow update: if liveUser()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['birthDate'])
+        && request.resource.data.birthDate is timestamp;
+
+      allow delete: if isGeneral();
+    }
+
+    // ───────────── attendance (سجل إضافة فقط؛ المعرّف = eventId_uid يمنع التكرار) ─────────────
+    match /attendance/{recordId} {
+      allow read: if activeUser() && (
+        isGeneral()
+        || resource.data.uid == request.auth.uid
+        || (isServant() && resource.data.section == mySection())
+      );
+
+      allow create: if activeUser()
+        && request.resource.data.keys().hasOnly(['uid', 'section', 'eventId', 'type', 'date', 'createdBy', 'createdAt'])
+        && request.resource.data.keys().hasAll(['uid', 'section', 'eventId', 'type', 'date', 'createdBy', 'createdAt'])
+        && isSection(request.resource.data.section)
+        && strLen(request.resource.data.eventId, 1, 100)
+        && strLen(request.resource.data.type, 1, 40)
+        && request.resource.data.date is timestamp
+        && recordId == request.resource.data.eventId + '_' + request.resource.data.uid
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && targetIsMember(request.resource.data.uid, request.resource.data.section)
+        && canManage(request.resource.data.section);
+
+      // لا تعديل (يمنع الكتابة فوق سجل موجود). حذف تصحيحي ضمن القسم فقط.
+      allow update: if false;
+      allow delete: if canManage(resource.data.section);
+    }
+
+    // ───────────── points (سجل العمليات هو المصدر؛ إضافة فقط) ─────────────
+    match /points/{pointId} {
+      allow read: if activeUser() && (
+        isGeneral()
+        || resource.data.uid == request.auth.uid
+        || (isServant() && resource.data.section == mySection())
+      );
+
+      allow create: if activeUser()
+        && request.resource.data.keys().hasOnly(
+             ['uid', 'section', 'amount', 'reason', 'category', 'competitionId', 'createdBy', 'createdAt'])
+        && request.resource.data.keys().hasAll(
+             ['uid', 'section', 'amount', 'reason', 'category', 'createdBy', 'createdAt'])
+        && isSection(request.resource.data.section)
+        && request.resource.data.amount is int
+        && request.resource.data.amount > 0
+        && request.resource.data.amount <= 1000
+        && strLen(request.resource.data.reason, 1, 300)
+        && request.resource.data.category in ['mass', 'tonia', 'communion', 'sunday_school', 'manual', 'competition']
+        && (request.resource.data.category != 'tonia' || request.resource.data.section == 'boys')
+        && (request.resource.data.category != 'competition' || (
+              request.resource.data.competitionId is string
+              && pointId == 'comp_' + request.resource.data.competitionId + '_' + request.resource.data.uid
+              && getAfter(/databases/$(database)/documents/competitionSubmissions/$(
+                   request.resource.data.competitionId + '_' + request.resource.data.uid)).data.status == 'approved'))
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && targetIsMember(request.resource.data.uid, request.resource.data.section)
+        && canManage(request.resource.data.section);
+
+      // التصحيح بيد الإدارة العامة فقط
+      allow update, delete: if isGeneral();
+    }
+
+    // ───────────── activities ─────────────
+    match /activities/{activityId} {
+      allow read: if activeUser() && (
+        isGeneral()
+        || resource.data.audience == 'all'
+        || resource.data.audience == mySection()
+      );
+
+      allow create: if activeUser()
+        && request.resource.data.keys().hasOnly(
+             ['title', 'description', 'imageUrl', 'location', 'date', 'audience',
+              'registrationDeadline', 'status', 'createdBy', 'createdAt'])
+        && request.resource.data.keys().hasAll(['title', 'audience', 'date', 'status', 'createdBy', 'createdAt'])
+        && strLen(request.resource.data.title, 1, 120)
+        && request.resource.data.audience in ['boys', 'girls', 'all']
+        && request.resource.data.status in ['active', 'cancelled']
+        && request.resource.data.date is timestamp
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && (isGeneral() || (request.resource.data.audience != 'all' && canManage(request.resource.data.audience)));
+
+      allow update: if activeUser()
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.audience in ['boys', 'girls', 'all']
+        && request.resource.data.status in ['active', 'cancelled']
+        && (isGeneral()
+            || (resource.data.audience != 'all'
+                && request.resource.data.audience == resource.data.audience
+                && canManage(resource.data.audience)));
+
+      allow delete: if isGeneral()
+        || (activeUser() && resource.data.audience != 'all' && canManage(resource.data.audience));
+    }
+
+    // ───────────── competitions ─────────────
+    match /competitions/{competitionId} {
+      allow read: if activeUser() && (
+        isGeneral()
+        || resource.data.audience == 'all'
+        || resource.data.audience == mySection()
+      );
+
+      allow create: if activeUser()
+        && request.resource.data.keys().hasOnly(
+             ['title', 'description', 'link', 'audience', 'points', 'startAt', 'endAt',
+              'status', 'createdBy', 'createdAt'])
+        && request.resource.data.keys().hasAll(
+             ['title', 'link', 'audience', 'points', 'startAt', 'endAt', 'status', 'createdBy', 'createdAt'])
+        && strLen(request.resource.data.title, 1, 120)
+        && request.resource.data.link is string
+        && request.resource.data.link.matches('^https?://.+')
+        && request.resource.data.points is int
+        && request.resource.data.points >= 0
+        && request.resource.data.points <= 1000
+        && request.resource.data.audience in ['boys', 'girls', 'all']
+        && request.resource.data.status in ['active', 'inactive']
+        && request.resource.data.startAt is timestamp
+        && request.resource.data.endAt is timestamp
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && (isGeneral() || (request.resource.data.audience != 'all' && canManage(request.resource.data.audience)));
+
+      allow update: if activeUser()
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.audience in ['boys', 'girls', 'all']
+        && request.resource.data.status in ['active', 'inactive']
+        && request.resource.data.link.matches('^https?://.+')
+        && request.resource.data.points is int
+        && request.resource.data.points >= 0
+        && request.resource.data.points <= 1000
+        && (isGeneral()
+            || (resource.data.audience != 'all'
+                && request.resource.data.audience == resource.data.audience
+                && canManage(resource.data.audience)));
+
+      allow delete: if isGeneral()
+        || (activeUser() && resource.data.audience != 'all' && canManage(resource.data.audience));
+    }
+
+    // ───────────── competitionSubmissions (المعرّف = competitionId_uid: مشاركة واحدة) ─────────────
+    match /competitionSubmissions/{submissionId} {
+      allow read: if activeUser() && (
+        isGeneral()
+        || resource.data.uid == request.auth.uid
+        || (isServant() && resource.data.section == mySection())
+      );
+
+      allow create: if activeUser()
+        && me().role == 'member'
+        && request.resource.data.keys().hasOnly(
+             ['competitionId', 'uid', 'section', 'answerEvidence', 'status', 'createdAt'])
+        && request.resource.data.keys().hasAll(
+             ['competitionId', 'uid', 'section', 'answerEvidence', 'status', 'createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.section == mySection()
+        && request.resource.data.status == 'pending'
+        && strLen(request.resource.data.answerEvidence, 1, 2000)
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.competitionId is string
+        && submissionId == request.resource.data.competitionId + '_' + request.auth.uid
+        && exists(/databases/$(database)/documents/competitions/$(request.resource.data.competitionId))
+        && get(/databases/$(database)/documents/competitions/$(request.resource.data.competitionId)).data.status == 'active'
+        && get(/databases/$(database)/documents/competitions/$(request.resource.data.competitionId)).data.audience in ['all', mySection()];
+
+      // المراجعة: الخادم في قسمه أو العام، مرة واحدة فقط من حالة pending
+      allow update: if activeUser()
+        && resource.data.status == 'pending'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'reviewedBy', 'reviewedAt'])
+        && request.resource.data.status in ['approved', 'rejected']
+        && request.resource.data.reviewedBy == request.auth.uid
+        && request.resource.data.reviewedAt == request.time
+        && canManage(resource.data.section);
+
+      allow delete: if isGeneral();
+    }
+
+    // ───────────── chats ─────────────
+    match /chats/{chatId} {
+      allow read: if canAccessChat(chatId);
+      allow create, update: if isGeneral()
+        && chatId in ['boys_members', 'girls_members', 'boys_servants', 'girls_servants', 'servants_all']
+        && request.resource.data.keys().hasOnly(['name', 'audience', 'createdBy', 'createdAt'])
+        && request.resource.data.createdBy == request.auth.uid;
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read: if canAccessChat(chatId);
+        allow create: if canAccessChat(chatId)
+          && request.resource.data.keys().hasOnly(['senderId', 'text', 'createdAt'])
+          && request.resource.data.senderId == request.auth.uid
+          && strLen(request.resource.data.text, 1, 2000)
+          && request.resource.data.createdAt == request.time;
+        allow update: if false;
+        allow delete: if canModerateChat(chatId);
+      }
+    }
+
+    // ───────────── notifications ─────────────
+    // uid = معرّف مستخدم، أو boys / girls / all لإعلان جماعي
+    match /notifications/{notificationId} {
+      allow read: if activeUser() && (
+        resource.data.uid == request.auth.uid
+        || (resource.data.uid in ['boys', 'girls'] && resource.data.uid == mySection())
+        || resource.data.uid == 'all'
+      );
+      // الإشعار الخاص بحالة الحساب يُقرأ أيضًا للمستخدم غير المفعّل (قبول/رفض)
+      allow read: if signedIn() && resource.data.uid == request.auth.uid;
+
+      allow create: if activeUser()
+        && request.resource.data.keys().hasOnly(['uid', 'title', 'body', 'type', 'relatedId', 'read', 'createdAt'])
+        && request.resource.data.keys().hasAll(['uid', 'title', 'body', 'type', 'read', 'createdAt'])
+        && strLen(request.resource.data.title, 1, 120)
+        && strLen(request.resource.data.body, 0, 500)
+        && strLen(request.resource.data.type, 1, 40)
+        && request.resource.data.read == false
+        && request.resource.data.createdAt == request.time
+        && (
+          isGeneral()
+          || (isServant() && (
+               (request.resource.data.uid in ['boys', 'girls'] && request.resource.data.uid == mySection())
+               || (hasUser(request.resource.data.uid)
+                   && userData(request.resource.data.uid).section == mySection())))
+        );
+
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+
+      allow delete: if signedIn() && (resource.data.uid == request.auth.uid || isGeneral());
+    }
+
+    // ───────────── settings ─────────────
+    match /settings/{docId} {
+      allow read: if signedIn();
+      allow write: if isGeneral()
+        && docId == 'app'
+        && request.resource.data.keys().hasOnly(
+             ['appName', 'boysEnabled', 'girlsEnabled', 'registrationEnabled', 'maintenanceMode'])
+        && request.resource.data.get('boysEnabled', true) is bool
+        && request.resource.data.get('girlsEnabled', true) is bool
+        && request.resource.data.get('registrationEnabled', true) is bool
+        && request.resource.data.get('maintenanceMode', false) is bool;
+    }
+  }
+}
