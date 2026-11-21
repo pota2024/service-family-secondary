@@ -1,12 +1,12 @@
+
 plugins {
     id "com.android.application"
     id "kotlin-android"
-    // Flutter Gradle Plugin يجب أن يأتي بعد Android و Kotlin
     id "dev.flutter.flutter-gradle-plugin"
     id "com.google.gms.google-services"
 }
 
-// توقيع اختياري: إن وُجد android/key.properties (يُنشأ من أسرار GitHub) يُستخدم، وإلا يُوقَّع بمفتاح debug.
+// Optional release signing configuration
 def keystoreProperties = new Properties()
 def keystorePropertiesFile = rootProject.file("key.properties")
 if (keystorePropertiesFile.exists()) {
@@ -15,7 +15,7 @@ if (keystorePropertiesFile.exists()) {
 
 android {
     namespace = "com.khedmetosretthanawy.app"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -29,7 +29,7 @@ android {
 
     defaultConfig {
         applicationId = "com.khedmetosretthanawy.app"
-        minSdk = 23 // مطلوب لحزم Firebase
+        minSdk = 23
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
@@ -48,7 +48,8 @@ android {
 
     buildTypes {
         release {
-            signingConfig = keystorePropertiesFile.exists() ? signingConfigs.release : signingConfigs.debug
+            signingConfig = keystorePropertiesFile.exists() ?
+                signingConfigs.release : signingConfigs.debug
         }
     }
 }
