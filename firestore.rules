@@ -51,6 +51,17 @@ service cloud.firestore {
         || get(settingsPath()).data.get('registrationEnabled', true) != false;
     }
 
+    // أول حساب عام: يُسمح به مرة واحدة فقط، ما دام settings/app غير موجود، وفي نفس الدفعة التي تنشئه
+    // (إنشاء settings/app يغلق الباب نهائيًا). لا يعمل بعد وجود الإعدادات.
+    function isBootstrapGeneral() {
+      return request.resource.data.role == 'general'
+        && request.resource.data.status == 'active'
+        && request.resource.data.section == 'all'
+        && !exists(settingsPath())
+        && existsAfter(settingsPath())
+        && getAfter(reqPath(request.auth.uid)).data.requestedRole == 'general';
+    }
+
     // الشات: الغرف الخمس ثابتة المعرفات
     function validChat(chatId) {
       return chatId in ['boys_members', 'girls_members', 'boys_servants', 'girls_servants', 'servants_all'];
@@ -86,10 +97,12 @@ service cloud.firestore {
         && registrationOpen()
         && request.resource.data.keys().hasOnly(['role', 'section', 'status', 'createdAt', 'updatedAt'])
         && request.resource.data.keys().hasAll(['role', 'section', 'status', 'createdAt'])
-        && request.resource.data.role == 'member'
-        && request.resource.data.status == 'pending'
         && request.resource.data.section in ['boys', 'girls', 'all']
         && request.resource.data.createdAt == request.time
+        && (
+          (request.resource.data.role == 'member' && request.resource.data.status == 'pending')
+          || isBootstrapGeneral()
+        )
         && existsAfter(reqPath(uid))
         && getAfter(reqPath(uid)).data.requestedSection == request.resource.data.section;
 
@@ -101,15 +114,21 @@ service cloud.firestore {
           && request.resource.data.role in ['member', 'servant', 'general']
           && request.resource.data.status in ['pending', 'active', 'rejected', 'suspended']
           && request.resource.data.section in ['boys', 'girls', 'all'])
-        // الخادم: يراجع المخدومين في قسمه فقط، ولا يغير إلا الحالة
+        // الخادم: يراجع مخدومي قسمه، ويستطيع قبول طلبات الخدام في قسمه (دور servant فقط)
         || (isServant()
           && resource.data.role == 'member'
           && resource.data.section == mySection()
-          && exists(reqPath(uid))
-          && get(reqPath(uid)).data.requestedRole == 'member'
-          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt', 'role'])
           && request.resource.data.status in ['active', 'rejected', 'suspended']
-          && request.resource.data.updatedAt == request.time);
+          && request.resource.data.updatedAt == request.time
+          && (
+            request.resource.data.role == 'member'
+            || (request.resource.data.role == 'servant'
+                && request.resource.data.status == 'active'
+                && exists(reqPath(uid))
+                && get(reqPath(uid)).data.requestedRole == 'servant'
+                && get(reqPath(uid)).data.requestedSection == mySection())
+          ));
 
       allow delete: if isGeneral();
     }
@@ -119,8 +138,7 @@ service cloud.firestore {
       allow read: if signedIn() && (
         request.auth.uid == uid
         || isGeneral()
-        || (isServant() && resource.data.requestedRole == 'member'
-            && resource.data.requestedSection == mySection())
+        || (isServant() && resource.data.requestedSection == mySection())
       );
 
       allow create: if signedIn()
@@ -130,7 +148,11 @@ service cloud.firestore {
         && request.resource.data.uid == request.auth.uid
         && strLen(request.resource.data.displayName, 2, 60)
         && request.resource.data.requestedRole in ['member', 'servant', 'general']
-        && request.resource.data.status == 'pending'
+        && (request.resource.data.status == 'pending'
+            || (request.resource.data.status == 'approved'
+                && request.resource.data.requestedRole == 'general'
+                && !exists(settingsPath())
+                && existsAfter(settingsPath())))
         && request.resource.data.createdAt == request.time
         && (
           (request.resource.data.requestedRole == 'general' && request.resource.data.requestedSection == 'all')
@@ -144,7 +166,6 @@ service cloud.firestore {
           && request.resource.data.status in ['approved', 'rejected']
           && request.resource.data.reviewedBy == request.auth.uid)
         || (isServant()
-          && resource.data.requestedRole == 'member'
           && resource.data.requestedSection == mySection()
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'reviewedBy', 'reviewedAt'])
           && request.resource.data.status in ['approved', 'rejected']
@@ -298,6 +319,57 @@ service cloud.firestore {
         || (activeUser() && resource.data.audience != 'all' && canManage(resource.data.audience));
     }
 
+    // ───────────── activities/{id}/registrations (تأكيد الاشتراك) ─────────────
+    function actData(activityId) {
+      return get(/databases/$(database)/documents/activities/$(activityId)).data;
+    }
+    match /activities/{activityId}/registrations/{regUid} {
+      allow read: if activeUser() && (
+        request.auth.uid == regUid
+        || isGeneral()
+        || (isServant() && actData(activityId).audience == mySection())
+      );
+      allow create: if activeUser()
+        && request.auth.uid == regUid
+        && me().role == 'member'
+        && request.resource.data.keys().hasOnly(['uid', 'section', 'createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.section == mySection()
+        && request.resource.data.createdAt == request.time
+        && actData(activityId).status == 'active'
+        && actData(activityId).audience in ['all', mySection()]
+        && (actData(activityId).get('registrationDeadline', null) == null
+            || request.time < actData(activityId).registrationDeadline);
+      allow update: if false;
+      allow delete: if activeUser() && (
+        request.auth.uid == regUid
+        || isGeneral()
+        || (isServant() && actData(activityId).audience == mySection())
+      );
+    }
+
+    // ───────────── verses (الآيات؛ يديرها العام) ─────────────
+    match /verses/{verseId} {
+      allow read: if activeUser();
+      allow create: if isGeneral()
+        && request.resource.data.keys().hasOnly(['text', 'reference', 'category', 'active', 'createdBy', 'createdAt'])
+        && request.resource.data.keys().hasAll(['text', 'reference', 'category', 'active', 'createdBy', 'createdAt'])
+        && strLen(request.resource.data.text, 1, 600)
+        && strLen(request.resource.data.reference, 1, 80)
+        && strLen(request.resource.data.category, 1, 30)
+        && request.resource.data.active is bool
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdAt == request.time;
+      allow update: if isGeneral()
+        && request.resource.data.keys().hasOnly(['text', 'reference', 'category', 'active', 'createdBy', 'createdAt'])
+        && request.resource.data.createdAt == resource.data.createdAt
+        && strLen(request.resource.data.text, 1, 600)
+        && strLen(request.resource.data.reference, 1, 80)
+        && strLen(request.resource.data.category, 1, 30)
+        && request.resource.data.active is bool;
+      allow delete: if isGeneral();
+    }
+
     // ───────────── competitions ─────────────
     match /competitions/{competitionId} {
       allow read: if activeUser() && (
@@ -393,7 +465,8 @@ service cloud.firestore {
       match /messages/{messageId} {
         allow read: if canAccessChat(chatId);
         allow create: if canAccessChat(chatId)
-          && request.resource.data.keys().hasOnly(['senderId', 'text', 'createdAt'])
+          && request.resource.data.keys().hasOnly(['senderId', 'senderName', 'text', 'createdAt'])
+          && (!('senderName' in request.resource.data) || strLen(request.resource.data.senderName, 0, 60))
           && request.resource.data.senderId == request.auth.uid
           && strLen(request.resource.data.text, 1, 2000)
           && request.resource.data.createdAt == request.time;
@@ -439,6 +512,15 @@ service cloud.firestore {
     // ───────────── settings ─────────────
     match /settings/{docId} {
       allow read: if signedIn();
+      allow create: if docId == 'app'
+        && signedIn()
+        && !exists(settingsPath())
+        && existsAfter(userPath(request.auth.uid))
+        && getAfter(userPath(request.auth.uid)).data.role == 'general'
+        && getAfter(userPath(request.auth.uid)).data.status == 'active'
+        && request.resource.data.keys().hasOnly(
+             ['appName', 'boysEnabled', 'girlsEnabled', 'registrationEnabled', 'maintenanceMode']);
+
       allow write: if isGeneral()
         && docId == 'app'
         && request.resource.data.keys().hasOnly(
