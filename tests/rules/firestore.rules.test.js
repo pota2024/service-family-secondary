@@ -91,7 +91,9 @@ describe('منع تغيير الدور/القسم/الحالة', () => {
   test('مخدوم لا يغير قسمه', async () => { await assertFails(db('bm').doc('users/bm').update({ section: 'girls' })); });
   test('معلّق لا يفعّل نفسه', async () => { await assertFails(db('pend').doc('users/pend').update({ status: 'active' })); });
   test('خادم لا يرقي نفسه', async () => { await assertFails(db('bs').doc('users/bs').update({ role: 'general', section: 'all' })); });
-  test('خادم لا يوافق على طلب خادم', async () => { await assertFails(db('bs').doc('users/sreq').update({ status: 'active', updatedAt: ts() })); });
+  test('خادم يقبل طلب خادم في قسمه (يصبح servant)', async () => { await assertSucceeds(db('bs').doc('users/sreq').update({ role: 'servant', status: 'active', updatedAt: ts() })); });
+  test('خادم لا يمنح دور general', async () => { await assertFails(db('bs').doc('users/sreq').update({ role: 'general', status: 'active', updatedAt: ts() })); });
+  test('خادم لا يرقي طلب مخدوم عادي إلى خادم', async () => { await assertFails(db('bs').doc('users/pend').update({ role: 'servant', status: 'active', updatedAt: ts() })); });
   test('خادم لا يرقي مخدومًا', async () => { await assertFails(db('bs').doc('users/pend').update({ role: 'servant', status: 'active', updatedAt: ts() })); });
   test('خادم بنين لا يراجع بنات', async () => {
     await env.withSecurityRulesDisabled(async (ctx) => {
@@ -102,12 +104,14 @@ describe('منع تغيير الدور/القسم/الحالة', () => {
   });
   test('خادم بنين يقبل مخدوم بنين', async () => { await assertSucceeds(db('bs').doc('users/pend').update({ status: 'active', updatedAt: ts() })); });
   test('العام يرقي طلب خادم', async () => { await assertSucceeds(db('gen').doc('users/sreq').update({ role: 'servant', status: 'active', updatedAt: ts() })); });
-  test('خادم لا يقرأ طلبات الخدام', async () => {
-    await assertFails(db('bs').doc('registrationRequests/sreq').get());
+  test('خادم يقرأ طلبات قسمه ولا يقرأ طلبات العام', async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => { await ctx.firestore().doc('registrationRequests/greq').set({ uid: 'greq', displayName: 'Gen Req', requestedRole: 'general', requestedSection: 'all', status: 'pending', createdAt: now() }); });
+    await assertSucceeds(db('bs').doc('registrationRequests/sreq').get());
     await assertSucceeds(db('bs').doc('registrationRequests/pend').get());
+    await assertFails(db('bs').doc('registrationRequests/greq').get());
   });
   test('استعلام طلبات القسم مسموح', async () => {
-    await assertSucceeds(db('bs').collection('registrationRequests').where('status', '==', 'pending').where('requestedRole', '==', 'member').where('requestedSection', '==', 'boys').get());
+    await assertSucceeds(db('bs').collection('registrationRequests').where('status', '==', 'pending').where('requestedSection', '==', 'boys').get());
   });
 });
 
@@ -306,4 +310,81 @@ describe('الإعدادات', () => {
 test('مجموعة غير معرّفة مرفوضة', async () => {
   await assertFails(db('gen').doc('whatever/x').set({ a: 1 }));
   await assertFails(db('gen').doc('whatever/x').get());
+});
+
+// ───────── أول حساب عام (Bootstrap) ─────────
+function bootBatch(uid) {
+  const f = db(uid); const b = f.batch();
+  b.set(f.doc(`users/${uid}`), { role: 'general', section: 'all', status: 'active', createdAt: ts(), updatedAt: ts() });
+  b.set(f.doc(`profiles/${uid}`), { displayName: 'Admin One', section: 'all', createdAt: ts() });
+  b.set(f.doc(`privateUsers/${uid}`), { phone: '+201000000009' });
+  b.set(f.doc(`registrationRequests/${uid}`), { uid, displayName: 'Admin One', requestedRole: 'general', requestedSection: 'all', status: 'approved', createdAt: ts() });
+  b.set(f.doc('settings/app'), { appName: 'x', boysEnabled: true, girlsEnabled: true, registrationEnabled: true, maintenanceMode: false });
+  return b;
+}
+describe('أول حساب عام', () => {
+  test('ممنوع بعد وجود الإعدادات', async () => { await assertFails(bootBatch('boot1').commit()); });
+  test('مسموح مرة واحدة عند عدم وجود الإعدادات ثم يُغلق', async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => { await ctx.firestore().doc('settings/app').delete(); });
+    await assertSucceeds(bootBatch('boot1').commit());
+    await assertFails(bootBatch('boot2').commit());
+  });
+  test('مخدوم لا ينشئ settings/app', async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => { await ctx.firestore().doc('settings/app').delete(); });
+    await assertFails(db('bm').doc('settings/app').set({ appName: 'x' }));
+  });
+  test('حساب active بدور general بدون settings في نفس الدفعة مرفوض', async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => { await ctx.firestore().doc('settings/app').delete(); });
+    const f = db('boot3'); const b = f.batch();
+    b.set(f.doc('users/boot3'), { role: 'general', section: 'all', status: 'active', createdAt: ts() });
+    b.set(f.doc('registrationRequests/boot3'), { uid: 'boot3', displayName: 'Admin', requestedRole: 'general', requestedSection: 'all', status: 'approved', createdAt: ts() });
+    await assertFails(b.commit());
+  });
+});
+
+// ───────── تأكيد الاشتراك في الأنشطة ─────────
+describe('اشتراك الأنشطة', () => {
+  beforeEach(async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await ctx.firestore().doc('activities/a1').set({ title: 'رحلة', audience: 'boys', date: now(), status: 'active', createdBy: 'bs', createdAt: now() });
+      await ctx.firestore().doc('activities/a2').set({ title: 'رحلة', audience: 'girls', date: now(), status: 'active', createdBy: 'gs', createdAt: now() });
+    });
+  });
+  const reg = (uid, sec) => ({ uid, section: sec, createdAt: ts() });
+  test('مخدوم يشترك في نشاط قسمه مرة واحدة', async () => {
+    await assertSucceeds(db('bm').doc('activities/a1/registrations/bm').set(reg('bm', 'boys')));
+    await assertFails(db('bm').doc('activities/a1/registrations/bm').set(reg('bm', 'boys')));
+  });
+  test('لا اشتراك في نشاط قسم آخر ولا باسم غيره', async () => {
+    await assertFails(db('bm').doc('activities/a2/registrations/bm').set(reg('bm', 'boys')));
+    await assertFails(db('bm').doc('activities/a1/registrations/bm2').set(reg('bm2', 'boys')));
+  });
+  test('الخادم يرى المشتركين في قسمه فقط', async () => {
+    await assertSucceeds(db('bs').collection('activities/a1/registrations').get());
+    await assertFails(db('bs').collection('activities/a2/registrations').get());
+  });
+  test('مخدوم لا يرى اشتراك غيره', async () => {
+    await assertFails(db('bm2').collection('activities/a1/registrations').get());
+  });
+  test('انتهاء آخر موعد يمنع الاشتراك', async () => {
+    await env.withSecurityRulesDisabled(async (ctx) => {
+      await ctx.firestore().doc('activities/a3').set({ title: 't', audience: 'boys', date: now(), status: 'active', registrationDeadline: firebase.firestore.Timestamp.fromMillis(Date.now() - 86400000), createdBy: 'bs', createdAt: now() });
+    });
+    await assertFails(db('bm').doc('activities/a3/registrations/bm').set(reg('bm', 'boys')));
+  });
+});
+
+// ───────── الآيات ─────────
+describe('الآيات', () => {
+  const verse = (over = {}) => ({ text: 'نص', reference: 'مرجع', category: 'تشجيع', active: true, createdBy: 'gen', createdAt: ts(), ...over });
+  test('العام يضيف والمخدوم يقرأ فقط', async () => {
+    await assertSucceeds(db('gen').collection('verses').add(verse()));
+    await assertFails(db('bm').collection('verses').add(verse({ createdBy: 'bm' })));
+    await assertSucceeds(db('bm').collection('verses').get());
+    await assertFails(db('bs').collection('verses').add(verse({ createdBy: 'bs' })));
+  });
+});
+
+test('رسالة الشات بـ senderName', async () => {
+  await assertSucceeds(db('bm').collection('chats/boys_members/messages').add({ senderId: 'bm', senderName: 'مينا', text: 'x', createdAt: ts() }));
 });
