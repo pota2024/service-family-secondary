@@ -83,7 +83,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     final me = s.appUser!;
     final name = s.profile?.displayName ?? '';
     final theme = context.watch<ThemeController>();
-    return ListView(padding: EdgeInsets.zero, children: [
+    return Scaffold(body: ListView(padding: EdgeInsets.zero, children: [
       Container(
         decoration: const BoxDecoration(gradient: AppColors.headerGradient, borderRadius: BorderRadius.vertical(bottom: Radius.circular(32))),
         padding: EdgeInsets.fromLTRB(20, MediaQuery.of(context).padding.top + 18, 20, 24),
@@ -139,7 +139,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
           ),
         ]),
       ),
-    ]);
+    ]));
   }
 
   Widget _row(IconData icon, String label, String value, {bool ltr = false}) => Row(children: [

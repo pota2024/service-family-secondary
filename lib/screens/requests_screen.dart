@@ -86,6 +86,7 @@ class _RequestTileState extends State<_RequestTile> {
       final userUpdate = <String, dynamic>{'status': approve ? 'active' : 'rejected', 'updatedAt': now};
       // رفع الدور (خادم/عام) مسموح للعام فقط؛ القواعد ترفض أي محاولة غير ذلك.
       if (approve && r.requestedRole != 'member') userUpdate['role'] = r.requestedRole;
+      if (approve && r.requestedRole == 'general' && !widget.me.isGeneral) throw 'اعتماد حساب عام من صلاحية الإدارة العامة فقط';
       batch.update(db.doc('users/${r.uid}'), userUpdate);
       batch.update(db.doc('registrationRequests/${r.uid}'), {
         'status': approve ? 'approved' : 'rejected',
@@ -104,7 +105,7 @@ class _RequestTileState extends State<_RequestTile> {
       await batch.commit();
       if (mounted) showSnack(context, approve ? 'تم قبول الطلب' : 'تم رفض الطلب');
     } catch (e) {
-      if (mounted) showSnack(context, AuthService.arabicError(e), error: true);
+      if (mounted) showSnack(context, e is String ? e : AuthService.arabicError(e), error: true);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
