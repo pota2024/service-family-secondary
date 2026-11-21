@@ -6,7 +6,6 @@ plugins {
     id "com.google.gms.google-services"
 }
 
-// Optional release signing configuration
 def keystoreProperties = new Properties()
 def keystorePropertiesFile = rootProject.file("key.properties")
 if (keystorePropertiesFile.exists()) {
@@ -15,8 +14,9 @@ if (keystorePropertiesFile.exists()) {
 
 android {
     namespace = "com.khedmetosretthanawy.app"
+
     compileSdk = 36
-    ndkVersion = flutter.ndkVersion
+    ndkVersion = "27.0.12077973"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
