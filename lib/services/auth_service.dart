@@ -45,14 +45,30 @@ class AuthService {
     try {
       final now = FieldValue.serverTimestamp();
       final batch = _db.batch();
-      // الدور دائمًا member والحالة pending؛ الدور المطلوب يُسجل في الطلب ولا يمنح صلاحية.
+      // أول حساب عام فقط: إذا لم تُنشأ الإعدادات بعد (settings/app) يصبح هذا الحساب هو العام الأول
+      // وتُنشأ الإعدادات في نفس الدفعة فيُغلق الباب. بعد ذلك تُعتمد كل الحسابات من داخل التطبيق.
+      var bootstrap = false;
+      if (kind == SignupKind.general) {
+        final st = await _db.doc('settings/app').get();
+        bootstrap = !st.exists;
+      }
+      // غير ذلك: الدور دائمًا member والحالة pending؛ الدور المطلوب يُسجل في الطلب فقط.
       batch.set(_db.doc('users/$uid'), {
-        'role': 'member',
+        'role': bootstrap ? 'general' : 'member',
         'section': kind.section,
-        'status': 'pending',
+        'status': bootstrap ? 'active' : 'pending',
         'createdAt': now,
         'updatedAt': now,
       });
+      if (bootstrap) {
+        batch.set(_db.doc('settings/app'), {
+          'appName': AppConfig.appName,
+          'boysEnabled': true,
+          'girlsEnabled': true,
+          'registrationEnabled': true,
+          'maintenanceMode': false,
+        });
+      }
       batch.set(_db.doc('profiles/$uid'), {
         'displayName': name,
         if (photoDataUri != null) 'photoUrl': photoDataUri,
@@ -68,7 +84,7 @@ class AuthService {
         'displayName': name,
         'requestedRole': kind.requestedRole,
         'requestedSection': kind.section,
-        'status': 'pending',
+        'status': bootstrap ? 'approved' : 'pending',
         'createdAt': now,
       });
       await batch.commit().timeout(const Duration(seconds: 30));

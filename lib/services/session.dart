@@ -84,6 +84,16 @@ class Session extends ChangeNotifier {
 
     _subs.add(_db.doc('settings/app').snapshots().listen((snap) {
       settings = AppSettings.fromMap(snap.data());
+      // أول تشغيل: العام يُنشئ settings/app فيُغلق باب إنشاء "أول حساب عام" نهائيًا.
+      if (!snap.exists && appUser?.isGeneral == true) {
+        _db.doc('settings/app').set({
+          'appName': 'خدمة أسرة ثانوي',
+          'boysEnabled': true,
+          'girlsEnabled': true,
+          'registrationEnabled': true,
+          'maintenanceMode': false,
+        }).catchError((_) {});
+      }
       notifyListeners();
     }, onError: (_) {}));
   }
